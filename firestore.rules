@@ -1,0 +1,125 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: customers
+    // Document ID: {customerId} (matches auth.uid)
+    // Fields: id, name, phone, location, joinedAt
+    //
+    // Collection: orders
+    // Document ID: {orderId}
+    // Fields: id, customerId, status, totalAmount, totalSavings, pointsEarned, deliveryTime, createdAt
+    //
+    // Collection: order_items
+    // Document ID: {itemId}
+    // Fields: orderId, productId, quantity, price, marketPrice
+    //
+    // Collection: products
+    // Document ID: {productId}
+    // Fields: id, name, category, costPrice, sellingPrice, stock, unit
+    //
+    // Collection: market_offers
+    // Document ID: {offerId}
+    // Fields: productId, marketName, offerPrice, validUntil
+    //
+    // Collection: customer_patterns
+    // Document ID: {customerId}
+    // Fields: customerId, preferredCategories, orderFrequency, nextPredictedOrder, lastAnalyzedAt
+    //
+    // Collection: customer_profiles
+    // Document ID: {customerId}
+    // Fields: customerId, behavior, personality, lifestyle, emotions
+    //
+    // Collection: loyalty_accounts
+    // Document ID: {customerId}
+    // Fields: customerId, pointsBalance, totalPointsEarned
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+          (request.auth.token.email == "hamada502250@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function isValidCustomer(data) {
+      return data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             data.phone is string && data.phone.size() > 5 && data.phone.size() < 20;
+    }
+
+    function isValidOrder(data) {
+      return data.customerId is string && data.customerId == request.auth.uid &&
+             data.totalAmount is number && data.totalAmount >= 0 &&
+             data.status in ['pending', 'confirmed', 'delivered', 'cancelled'];
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /customers/{customerId} {
+      allow read: if isOwner(customerId) || isAdmin();
+      allow create: if isOwner(customerId) && isValidCustomer(request.resource.data);
+      allow update: if isOwner(customerId) && isValidCustomer(request.resource.data);
+    }
+
+    match /orders/{orderId} {
+      allow read: if isAuthenticated() && (resource.data.customerId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && isValidOrder(request.resource.data);
+      allow update: if isAuthenticated() && (resource.data.customerId == request.auth.uid || isAdmin()) && isValidOrder(request.resource.data);
+    }
+
+    match /order_items/{itemId} {
+      allow read: if isAuthenticated(); // Simplified for now, should ideally check order ownership
+      allow create: if isAuthenticated();
+      allow update: if isAdmin();
+    }
+
+    match /products/{productId} {
+      allow read: if true;
+      allow write: if true; // Temporarily allow for server seeding
+    }
+
+    match /market_offers/{offerId} {
+      allow read: if true;
+      allow write: if true; // Temporarily allow for scraper
+    }
+
+    match /customer_patterns/{customerId} {
+      allow read: if isOwner(customerId) || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /customer_profiles/{customerId} {
+      allow read: if isOwner(customerId) || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    match /loyalty_accounts/{customerId} {
+      allow read: if isOwner(customerId) || isAdmin();
+      allow write: if isAdmin();
+    }
+    
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}

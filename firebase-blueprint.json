@@ -1,0 +1,149 @@
+{
+  "entities": {
+    "Customer": {
+      "title": "Customer",
+      "description": "بيانات العميل وشخصيته",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "phone": { "type": "string" },
+        "location": { "type": "string" },
+        "joinedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "phone"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "كل طلب بتاريخه ووقته",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "customerId": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "confirmed", "delivered", "cancelled"] },
+        "totalAmount": { "type": "number" },
+        "totalSavings": { "type": "number" },
+        "pointsEarned": { "type": "number" },
+        "deliveryTime": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "customerId", "status", "totalAmount"]
+    },
+    "OrderItem": {
+      "title": "OrderItem",
+      "description": "تفاصيل كل منتج في كل طلب",
+      "type": "object",
+      "properties": {
+        "orderId": { "type": "string" },
+        "productId": { "type": "string" },
+        "quantity": { "type": "number" },
+        "price": { "type": "number" },
+        "marketPrice": { "type": "number" }
+      },
+      "required": ["orderId", "productId", "quantity", "price"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "مخزونك وأسعار التكلفة",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "category": { "type": "string" },
+        "costPrice": { "type": "number" },
+        "sellingPrice": { "type": "number" },
+        "stock": { "type": "number" },
+        "unit": { "type": "string" }
+      },
+      "required": ["id", "name", "sellingPrice"]
+    },
+    "MarketOffer": {
+      "title": "MarketOffer",
+      "description": "عروض السلاسل أسبوعياً",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "productName": { "type": "string" },
+        "marketName": { "type": "string" },
+        "offerPrice": { "type": "number" },
+        "originalPrice": { "type": "number" },
+        "discount": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "validUntil": { "type": "string", "format": "date-time" },
+        "scrapedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["productName", "marketName", "offerPrice"]
+    },
+    "CustomerPattern": {
+      "title": "CustomerPattern",
+      "description": "أنماط كل عميل + توقع الطلب الجاي",
+      "type": "object",
+      "properties": {
+        "customerId": { "type": "string" },
+        "preferredCategories": { "type": "array", "items": { "type": "string" } },
+        "orderFrequency": { "type": "string" },
+        "nextPredictedOrder": { "type": "string", "format": "date-time" },
+        "lastAnalyzedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["customerId"]
+    },
+    "CustomerProfile": {
+      "title": "CustomerProfile",
+      "description": "شخصية العميل وأسلوبه (الطبقات الأربع)",
+      "type": "object",
+      "properties": {
+        "customerId": { "type": "string" },
+        "behavior": { "type": "string" },
+        "personality": { "type": "string" },
+        "lifestyle": { "type": "string" },
+        "emotions": { "type": "string" }
+      },
+      "required": ["customerId"]
+    },
+    "LoyaltyAccount": {
+      "title": "LoyaltyAccount",
+      "description": "رصيد نقاط كل عميل",
+      "type": "object",
+      "properties": {
+        "customerId": { "type": "string" },
+        "pointsBalance": { "type": "number" },
+        "totalPointsEarned": { "type": "number" }
+      },
+      "required": ["customerId", "pointsBalance"]
+    }
+  },
+  "firestore": {
+    "/customers/{customerId}": {
+      "schema": "Customer",
+      "description": "بيانات العملاء"
+    },
+    "/orders/{orderId}": {
+      "schema": "Order",
+      "description": "طلبات العملاء"
+    },
+    "/order_items/{itemId}": {
+      "schema": "OrderItem",
+      "description": "تفاصيل المنتجات في الطلبات"
+    },
+    "/products/{productId}": {
+      "schema": "Product",
+      "description": "مخزون المنتجات"
+    },
+    "/market_offers/{offerId}": {
+      "schema": "MarketOffer",
+      "description": "عروض السوق"
+    },
+    "/customer_patterns/{customerId}": {
+      "schema": "CustomerPattern",
+      "description": "أنماط استهلاك العملاء"
+    },
+    "/customer_profiles/{customerId}": {
+      "schema": "CustomerProfile",
+      "description": "ملفات شخصية العملاء"
+    },
+    "/loyalty_accounts/{customerId}": {
+      "schema": "LoyaltyAccount",
+      "description": "حسابات الولاء"
+    }
+  }
+}
