@@ -1,171 +1,73 @@
-import { 
-  collection, 
-  query, 
-  where, 
-  onSnapshot, 
-  addDoc, 
-  serverTimestamp, 
-  doc, 
-  getDoc,
-  setDoc,
-  deleteDoc,
-  orderBy,
-  limit
-} from 'firebase/firestore';
-import { db, auth } from '../firebase';
+import {
+  collection, query, where, onSnapshot, addDoc,
+  serverTimestamp, doc, setDoc, deleteDoc,
+  orderBy, limit, getDoc, updateDoc
+} from "firebase/firestore";
+import { db, auth } from "../firebase";
 
-export enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
-
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId: string | undefined;
-    email: string | null | undefined;
-    emailVerified: boolean | undefined;
-    isAnonymous: boolean | undefined;
-    tenantId: string | null | undefined;
-    providerInfo: {
-      providerId: string;
-      displayName: string | null;
-      email: string | null;
-      photoUrl: string | null;
-    }[];
-  }
-}
-
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData.map(provider => ({
-        providerId: provider.providerId,
-        displayName: provider.displayName,
-        email: provider.email,
-        photoUrl: provider.photoURL
-      })) || []
-    },
-    operationType,
-    path
-  }
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
-}
-
-export const subscribeToOrders = (userId: string, callback: (orders: any[]) => void) => {
-  const q = query(
-    collection(db, 'orders'), 
-    where('customerId', '==', userId),
-    orderBy('createdAt', 'desc'),
-    limit(10)
+// ═══════════════════════════════════════
+// Orders
+// ═══════════════════════════════════════
+export const subscribeToAllOrders = (cb: (o: any[]) => void) =>
+  onSnapshot(
+    query(collection(db, "orders"), orderBy("created_at", "desc"), limit(50)),
+    snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() })))
   );
-  
-  return onSnapshot(q, (snapshot) => {
-    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    callback(orders);
-  }, (error) => {
-    handleFirestoreError(error, OperationType.LIST, 'orders');
+
+export const createOrder = async (
+  userId: string, totalAmount: number, totalSavings: number, pointsEarned: number
+) => {
+  await addDoc(collection(db, "orders"), {
+    customer_id: userId, customerId: userId,
+    status: "confirmed",
+    total_amount: totalAmount, totalAmount,
+    total_savings: totalSavings, totalSavings,
+    points_earned: pointsEarned,
+    created_at: serverTimestamp(), createdAt: serverTimestamp(),
+    source: "dashboard",
   });
 };
 
-export const subscribeToLoyalty = (userId: string, callback: (loyalty: any) => void) => {
-  const docRef = doc(db, 'loyalty_accounts', userId);
-  return onSnapshot(docRef, (snapshot) => {
-    callback(snapshot.data());
-  }, (error) => {
-    handleFirestoreError(error, OperationType.GET, `loyalty_accounts/${userId}`);
-  });
-};
-
-export const subscribeToProfile = (userId: string, callback: (profile: any) => void) => {
-  const docRef = doc(db, 'customer_profiles', userId);
-  return onSnapshot(docRef, (snapshot) => {
-    callback(snapshot.data());
-  }, (error) => {
-    handleFirestoreError(error, OperationType.GET, `customer_profiles/${userId}`);
-  });
-};
-
-export const subscribeToAllOrders = (callback: (orders: any[]) => void) => {
-  const q = query(
-    collection(db, 'orders'), 
-    orderBy('createdAt', 'desc'),
-    limit(50)
+// ═══════════════════════════════════════
+// Customers
+// ═══════════════════════════════════════
+export const subscribeToCustomers = (cb: (c: any[]) => void) =>
+  onSnapshot(
+    query(collection(db, "customers"), orderBy("total_orders", "desc"), limit(50)),
+    snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() })))
   );
-  
-  return onSnapshot(q, (snapshot) => {
-    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    callback(orders);
-  }, (error) => {
-    handleFirestoreError(error, OperationType.LIST, 'orders');
-  });
-};
 
-export const createOrder = async (userId: string, totalAmount: number, totalSavings: number, pointsEarned: number) => {
-  try {
-    const orderData = {
-      customerId: userId,
-      status: 'pending',
-      totalAmount,
-      totalSavings,
-      pointsEarned,
-      createdAt: serverTimestamp(),
-      deliveryTime: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() // Tomorrow
-    };
-    await addDoc(collection(db, 'orders'), orderData);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, 'orders');
-  }
-};
+export const subscribeToLoyalty = (userId: string, cb: (l: any) => void) =>
+  onSnapshot(doc(db, "loyalty_accounts", userId), snap => cb(snap.data()));
 
-export const subscribeToProducts = (callback: (products: any[]) => void) => {
-  const q = query(collection(db, 'products'), orderBy('name', 'asc'));
-  return onSnapshot(q, (snapshot) => {
-    const products = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    callback(products);
-  }, (error) => {
-    handleFirestoreError(error, OperationType.LIST, 'products');
-  });
-};
+export const subscribeToProfile = (userId: string, cb: (p: any) => void) =>
+  onSnapshot(doc(db, "customer_profiles", userId), snap => cb(snap.data()));
 
-export const addProduct = async (product: any) => {
-  try {
-    await addDoc(collection(db, 'products'), {
-      ...product,
-      createdAt: serverTimestamp()
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.CREATE, 'products');
-  }
-};
+// ═══════════════════════════════════════
+// Products / Market Offers
+// ═══════════════════════════════════════
+export const subscribeToProducts = (cb: (p: any[]) => void) =>
+  onSnapshot(
+    query(collection(db, "products"), orderBy("name", "asc")),
+    snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() })))
+  );
 
-export const updateProduct = async (productId: string, product: any) => {
-  try {
-    const docRef = doc(db, 'products', productId);
-    await setDoc(docRef, { ...product, updatedAt: serverTimestamp() }, { merge: true });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, `products/${productId}`);
-  }
-};
+export const subscribeToMarketOffers = (cb: (o: any[]) => void) =>
+  onSnapshot(
+    collection(db, "market_offers"),
+    snap => cb(snap.docs.map(d => ({ id: d.id, ...d.data() })))
+  );
 
-export const deleteProduct = async (productId: string) => {
-  try {
-    const docRef = doc(db, 'products', productId);
-    await deleteDoc(docRef);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, `products/${productId}`);
-  }
+export const addProduct = async (product: any) =>
+  addDoc(collection(db, "products"), { ...product, createdAt: serverTimestamp() });
+
+export const updateProduct = async (id: string, data: any) =>
+  setDoc(doc(db, "products", id), { ...data, updatedAt: serverTimestamp() }, { merge: true });
+
+export const deleteProduct = async (id: string) =>
+  deleteDoc(doc(db, "products", id));
+
+export const saveMarketOffer = async (offer: any) => {
+  const id = Buffer.from(offer.productName + offer.marketName).toString("base64").slice(0, 20);
+  await setDoc(doc(db, "market_offers", id), { ...offer, updatedAt: serverTimestamp() }, { merge: true });
 };
