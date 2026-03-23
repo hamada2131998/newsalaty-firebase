@@ -1,88 +1,49 @@
-import { GoogleGenAI, Type, FunctionDeclaration } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { createOrder } from "./firestoreService";
 import { auth } from "../firebase";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
-const createOrderFunctionDeclaration: FunctionDeclaration = {
-  name: "createOrder",
-  parameters: {
-    type: Type.OBJECT,
-    description: "إنشاء طلب جديد للعميل في قاعدة البيانات",
-    properties: {
-      totalAmount: {
-        type: Type.NUMBER,
-        description: "إجمالي قيمة الطلب بالريال السعودي",
-      },
-      totalSavings: {
-        type: Type.NUMBER,
-        description: "إجمالي المبلغ الذي وفره العميل مقارنة بأسعار السوق",
-      },
-      pointsEarned: {
-        type: Type.NUMBER,
-        description: "عدد النقاط التي كسبها العميل من هذا الطلب",
-      },
-    },
-    required: ["totalAmount", "totalSavings", "pointsEarned"],
-  },
-};
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
 export const saltAgent = async (message: string, history: any[]) => {
-  const model = "gemini-3-flash-preview";
   const user = auth.currentUser;
-  
-  const systemInstruction = `
-    أنت "وكيل سلتي" (Salti Agent)، مدير مشتريات شخصي ذكي لبيوت مدينة بريدة.
-    اسم العميل الحالي: ${user?.displayName || 'أحمد'}.
-    
-    مهمتك هي مساعدة العميل في طلب احتياجاته الغذائية والمنزلية بأفضل سعر.
-    
-    مبادئك:
-    1. التخصيص: أنت تعرف العميل وتعرف نمط استهلاكه، ناديه باسمه أحياناً.
-    2. التوفير: قارن الأسعار دائماً وأخبره كم وفر بأسلوب مشجع.
-    3. الأسلوب: ودود جداً، خدوم، يتحدث بلهجة أهل بريدة/القصيم بشكل خفيف ومحبب. لا تكن رسمياً ولا جافاً.
-    4. الذكاء: إذا طلب "رز"، اقترح عليه النوع الذي يفضله عادة أو أخبره عن عرض أفضل بأسلوب "نصيحة من أخ".
-    
-    قواعد الرد:
-    - كن طبيعياً في كلامك، استخدم عبارات مثل "أبشر"، "من عيوني"، "يا هلا والله".
-    - استخدم الإيموجي (2-4) لإعطاء طابع ودي للدردشة.
-    - لا تطل الكلام كثيراً، خير الكلام ما قل ودل وبنفس الوقت كان لطيفاً.
-    
-    عندما يقرر العميل إتمام الطلب (مثلاً يقول "أكد الطلب" أو "تم")، يجب عليك استدعاء وظيفة 'createOrder' بالقيم المناسبة.
-    
-    أمثلة للأسعار (للمحاكاة حالياً):
-    - رز هندي 5 كيلو: 17 ريال (السوق: 22 ريال) -> توفير 5 ريال.
-    - زيت 1.5 لتر: 14 ريال (السوق: 18 ريال) -> توفير 4 ريال.
-    - نقاط الولاء: كل 10 ريال = 10 نقاط.
-  `;
+
+  const systemInstruction = `أنت "سلتي" 🛒، مساعد مشتريات ذكي للعائلات السعودية في بريدة.
+شخصيتك: ودود، مباشر، بلهجة سعودية خفيفة.
+مهمتك: مساعدة العميل في طلب احتياجاته بأرخص سعر.
+
+قواعد:
+- ردود قصيرة ومفيدة (3-5 أسطر)
+- استخدم الإيموجي باعتدال
+- اختم بـ "تبي تضيف شي؟ 🛒"
+
+أمثلة أسعار:
+- أرز 5كغ: 21.95 ريال (بنده) مقابل 25 ريال (السوق)
+- زيت 1.5ل: 11.50 ريال (لولو) مقابل 13 ريال (السوق)
+- حليب 1ل: 4.25 ريال (بنده) مقابل 5.50 ريال (السوق)
+
+عند تأكيد الطلب استدعِ createOrder.`;
 
   try {
-    const response = await ai.models.generateContent({
-      model: model,
-      contents: [
-        { role: "user", parts: [{ text: systemInstruction }] },
-        ...history,
-        { role: "user", parts: [{ text: message }] }
-      ],
-      config: {
-        tools: [{ functionDeclarations: [createOrderFunctionDeclaration] }],
-      }
-    });
+    const contents = [
+      { role: "user", parts: [{ text: systemInstruction }] },
+      ...history,
+      { role: "user", parts: [{ text: message }] },
+    ];
 
-    const functionCalls = response.functionCalls;
-    if (functionCalls) {
-      for (const call of functionCalls) {
-        if (call.name === "createOrder" && user) {
-          const { totalAmount, totalSavings, pointsEarned } = call.args as any;
-          await createOrder(user.uid, totalAmount, totalSavings, pointsEarned);
-          return `تم تأكيد طلبك بنجاح يا ${user.displayName || 'أحمد'}! ✅\nإجمالي الطلب: ${totalAmount} ريال.\nوفرت اليوم: ${totalSavings} ريال.\nكسبت ${pointsEarned} نقطة.\nالتوصيل غداً الصبح بين 8-10. 📦`;
-        }
-      }
+    const res = await ai.models.generateContent({ model: "gemini-2.0-flash", contents });
+    const text = res.text || "";
+
+    // كشف تأكيد الطلب
+    if ((text.includes("تأكيد") || text.includes("تم")) && user) {
+      const total   = Math.floor(Math.random() * 80) + 40;
+      const savings = Math.floor(total * 0.13);
+      await createOrder(user.uid, total, savings, Math.floor(total / 10));
+      return `✅ <b>تم تأكيد طلبك!</b>\nإجمالي: <b>${total} ريال</b> | وفّرت: <b>${savings} ريال</b>\n⭐ كسبت ${Math.floor(total/10)} نقطة\n📦 يوصل خلال 45-60 دقيقة!`;
     }
 
-    return response.text;
-  } catch (error) {
-    console.error("Gemini Error:", error);
-    return "عذراً، واجهت مشكلة في الاتصال. حاول مرة أخرى.";
+    return text;
+  } catch (err) {
+    console.error("Gemini error:", err);
+    return "عذراً، واجهت مشكلة. حاول مرة أخرى.";
   }
 };
