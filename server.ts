@@ -1,305 +1,375 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import { Telegraf } from "telegraf";
+import { Telegraf, Context } from "telegraf";
 import { GoogleGenAI } from "@google/genai";
-import { initializeApp } from 'firebase/app';
-import { getFirestore, collection, addDoc, serverTimestamp, query, where, getDocs, limit, orderBy, doc, setDoc } from 'firebase/firestore';
-import axios from "axios";
-import * as cheerio from "cheerio";
+import { initializeApp } from "firebase/app";
+import {
+  getFirestore, collection, addDoc, serverTimestamp,
+  query, where, getDocs, limit, orderBy, doc, setDoc,
+  updateDoc, getDoc, increment
+} from "firebase/firestore";
+import firebaseConfig from "./firebase-applet-config.json" with { type: "json" };
 
-// Import the Firebase configuration
-import firebaseConfig from './firebase-applet-config.json' with { type: "json" };
-
-// Initialize Firebase SDK for Server
 const firebaseApp = initializeApp(firebaseConfig);
 const db = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+const bot = process.env.TELEGRAM_BOT_TOKEN ? new Telegraf(process.env.TELEGRAM_BOT_TOKEN) : null;
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
 
-// Initialize Telegram Bot
-const botToken = process.env.TELEGRAM_BOT_TOKEN;
-const bot = botToken ? new Telegraf(botToken) : null;
+// ═══════════════════════════════════════════
+// دورة نفاد المنتجات (بالأيام)
+// ═══════════════════════════════════════════
+const REPLENISHMENT: Record<string, number> = {
+  "خبز": 2, "حليب": 3, "لبن": 4, "بيض": 7,
+  "دجاج": 7, "لحم": 7, "خضار": 5, "فاكهة": 6,
+  "أرز": 14, "رز": 14, "زيت": 18, "سكر": 20,
+  "شاي": 21, "طحين": 25, "معكرونة": 20, "عصير": 14,
+};
 
-async function scrapeOffers() {
-  console.log("Starting scrape...");
-  try {
-    const url = "https://d4donline.com/en/saudi-arabia/buraidah/offers";
-    const { data } = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-    const $ = cheerio.load(data);
-    const offers: any[] = [];
+// ═══════════════════════════════════════════
+// جلب / إنشاء العميل
+// ═══════════════════════════════════════════
+async function getOrCreateCustomer(chatId: number, name: string) {
+  const id = String(chatId);
+  const ref = doc(db, "customers", id);
+  const snap = await getDoc(ref);
+  if (snap.exists()) {
+    await updateDoc(ref, { last_active_at: serverTimestamp() });
+    return snap.data();
+  }
+  const data = {
+    telegram_id: id, name,
+    total_orders: 0, total_spent: 0, loyalty_points: 0,
+    repeat_items: {}, pending_order: null,
+    created_at: serverTimestamp(), last_active_at: serverTimestamp(),
+  };
+  await setDoc(ref, data);
+  return data;
+}
 
-    // This is a generic selector, might need adjustment based on actual site structure
-    // D4D usually has items in cards. Let's try to find common patterns.
-    $(".product-card, .item-card, .offer-item").each((i, el) => {
-      const productName = $(el).find(".product-title, .item-name, h3").text().trim();
-      const marketName = $(el).find(".store-name, .market-name").text().trim() || "متجر بريدة";
-      const offerPriceText = $(el).find(".offer-price, .current-price, .price").text().trim();
-      const originalPriceText = $(el).find(".original-price, .old-price, .was-price").text().trim();
-      
-      const offerPrice = parseFloat(offerPriceText.replace(/[^0-9.]/g, ''));
-      const originalPrice = parseFloat(originalPriceText.replace(/[^0-9.]/g, '')) || offerPrice * 1.2;
+// ═══════════════════════════════════════════
+// تاريخ المحادثة
+// ═══════════════════════════════════════════
+async function getHistory(chatId: string, lim = 12) {
+  const q = query(
+    collection(db, "messages"),
+    where("customer_id", "==", chatId),
+    orderBy("created_at", "desc"),
+    limit(lim)
+  );
+  const snap = await getDocs(q);
+  return snap.docs.map(d => d.data()).reverse();
+}
 
-      if (productName && offerPrice) {
-        offers.push({
-          productName,
-          marketName,
-          offerPrice,
-          originalPrice: Math.round(originalPrice * 100) / 100,
-          discount: originalPrice > offerPrice ? `${Math.round((1 - offerPrice/originalPrice) * 100)}%` : "0%",
-          scrapedAt: new Date().toISOString()
-        });
-      }
-    });
+async function saveMsg(chatId: string, role: string, text: string) {
+  await addDoc(collection(db, "messages"), {
+    customer_id: chatId, role, content: text,
+    created_at: serverTimestamp(),
+  });
+}
 
-    // Fallback if no items found (site might be dynamic or structure changed)
-    if (offers.length === 0) {
-      console.log("No specific items found, scraping flyer titles...");
-      $(".flyer-card, .catalog-card").each((i, el) => {
-        const title = $(el).find(".flyer-title, h4").text().trim();
-        if (title) {
-          offers.push({
-            productName: title,
-            marketName: title.split(" ")[0] || "متجر",
-            offerPrice: Math.floor(Math.random() * 50) + 10,
-            originalPrice: Math.floor(Math.random() * 20) + 60,
-            discount: "عرض خاص",
-            scrapedAt: new Date().toISOString()
-          });
+// ═══════════════════════════════════════════
+// أسعار من قاعدة البيانات
+// ═══════════════════════════════════════════
+async function findPrice(name: string) {
+  const snap = await getDocs(collection(db, "market_offers"));
+  let best: any = null;
+  snap.forEach(d => {
+    const p = d.data();
+    if ((p.productName || "").includes(name) || name.includes(p.productName || "")) {
+      if (!best || p.offerPrice < best.offerPrice) best = p;
+    }
+  });
+  return best;
+}
+
+// ═══════════════════════════════════════════
+// تسعير الطلب
+// ═══════════════════════════════════════════
+async function priceOrder(items: { name: string; qty: number; unit: string }[]) {
+  const priced = [];
+  let total = 0, saving = 0;
+  for (const item of items) {
+    const found = await findPrice(item.name);
+    let price = found?.offerPrice || 10;
+    let orig  = found?.originalPrice || price * 1.15;
+    let store = found?.marketName || "متوسط السوق";
+    const itemSaving = Math.max(0, (orig - price) * item.qty);
+    priced.push({ ...item, price, store, item_total: price * item.qty, saving: itemSaving });
+    total   += price * item.qty;
+    saving  += itemSaving;
+  }
+  return { items: priced, total: +total.toFixed(2), saving: +saving.toFixed(2) };
+}
+
+// ═══════════════════════════════════════════
+// منتجات على وشك النفاد
+// ═══════════════════════════════════════════
+async function getUrgentItems(chatId: string): Promise<string[]> {
+  const snap = await getDocs(
+    query(collection(db, "orders"),
+      where("customer_id", "==", chatId),
+      orderBy("created_at", "desc"), limit(10))
+  );
+  const urgent: string[] = [];
+  snap.forEach(d => {
+    const o = d.data();
+    const date: Date = o.created_at?.toDate?.() || new Date();
+    for (const item of (o.items || [])) {
+      for (const [key, days] of Object.entries(REPLENISHMENT)) {
+        if ((item.name || "").includes(key)) {
+          const left = days - Math.floor((Date.now() - date.getTime()) / 86400000);
+          if (left >= 0 && left <= 2) urgent.push(item.name);
         }
-      });
-    }
-
-    // Save to Firestore
-    for (const offer of offers.slice(0, 20)) { // Limit to 20 for now
-      const offerId = Buffer.from(`${offer.productName}-${offer.marketName}`).toString('base64').substring(0, 20);
-      await setDoc(doc(db, 'market_offers', offerId), offer);
-    }
-
-    console.log(`Scraped and saved ${offers.length} offers.`);
-    return offers;
-  } catch (error) {
-    console.error("Scrape Error:", error);
-    return [];
-  }
-}
-
-async function getLatestOffers() {
-  try {
-    const q = query(collection(db, 'market_offers'), limit(15));
-    const snapshot = await getDocs(q);
-    return snapshot.docs.map(doc => doc.data());
-  } catch (error) {
-    console.error("Error fetching offers:", error);
-    return [];
-  }
-}
-
-async function seedProducts() {
-  console.log("Checking if products need seeding...");
-  try {
-    const productsRef = collection(db, 'products');
-    const q = query(productsRef, limit(1));
-    const snapshot = await getDocs(q);
-
-    if (snapshot.empty) {
-      console.log("Seeding initial products...");
-      const initialProducts = [
-        // أرز ومواد تموينية
-        { name: "رز الوليمة 5 كيلو", sellingPrice: 45, stock: 100, unit: "كيس", category: "أرز" },
-        { name: "رز الشعلان 10 كيلو", sellingPrice: 85, stock: 50, unit: "كيس", category: "أرز" },
-        { name: "سكر الأسرة 5 كيلو", sellingPrice: 22, stock: 80, unit: "كيس", category: "سكر" },
-        { name: "ملح ساسا 700 جم", sellingPrice: 1.5, stock: 500, unit: "حبة", category: "تموين" },
-        
-        // زيوت ومعلبات
-        { name: "زيت عافية 1.5 لتر", sellingPrice: 18, stock: 150, unit: "حبة", category: "زيوت" },
-        { name: "زيت صني 1.5 لتر", sellingPrice: 14, stock: 200, unit: "حبة", category: "زيوت" },
-        { name: "تونة قودي 185 جم", sellingPrice: 7.5, stock: 300, unit: "حبة", category: "معلبات" },
-        { name: "فول حدائق كاليفورنيا", sellingPrice: 3.5, stock: 450, unit: "حبة", category: "معلبات" },
-        
-        // ألبان ومشروبات
-        { name: "حليب المراعي 1 لتر", sellingPrice: 6, stock: 300, unit: "حبة", category: "ألبان" },
-        { name: "زبادي نادك 2 كيلو", sellingPrice: 12, stock: 100, unit: "حبة", category: "ألبان" },
-        { name: "شاي ليبتون 100 كيس", sellingPrice: 14, stock: 120, unit: "علبة", category: "مشروبات" },
-        { name: "قهوة نسكافيه 200 جم", sellingPrice: 32, stock: 60, unit: "حبة", category: "مشروبات" },
-        { name: "بيبسي 330 مل", sellingPrice: 2.5, stock: 1000, unit: "حبة", category: "مشروبات" },
-        
-        // مجمدات ولحوم
-        { name: "دجاج ساديا 1000 جم", sellingPrice: 16, stock: 200, unit: "حبة", category: "مجمدات" },
-        { name: "برجر أمريكانا بقر", sellingPrice: 24, stock: 80, unit: "علبة", category: "مجمدات" },
-        { name: "خضار مشكل ساديا", sellingPrice: 6, stock: 150, unit: "كيس", category: "مجمدات" },
-        
-        // منظفات وعناية
-        { name: "صابون تايد 2.5 كيلو", sellingPrice: 35, stock: 90, unit: "كيس", category: "منظفات" },
-        { name: "سائل فيري 1 لتر", sellingPrice: 12, stock: 180, unit: "حبة", category: "منظفات" },
-        { name: "شامبو هيد آند شولدرز", sellingPrice: 22, stock: 110, unit: "حبة", category: "عناية" },
-        { name: "معجون كولجيت 100 مل", sellingPrice: 9, stock: 250, unit: "حبة", category: "عناية" }
-      ];
-
-      for (const product of initialProducts) {
-        const productId = Buffer.from(product.name).toString('base64').substring(0, 15);
-        await setDoc(doc(db, 'products', productId), {
-          ...product,
-          createdAt: serverTimestamp()
-        });
       }
-      console.log("Seeding complete.");
-    } else {
-      console.log("Products already exist, skipping seed.");
     }
-  } catch (error) {
-    console.error("Seed Error:", error);
-  }
+  });
+  return [...new Set(urgent)].slice(0, 3);
 }
 
+// ═══════════════════════════════════════════
+// بناء System Prompt مخصص
+// ═══════════════════════════════════════════
+async function buildPrompt(chatId: string, cust: any): Promise<string> {
+  const repeat = cust.repeat_items || {};
+  const top = Object.entries(repeat).sort((a: any, b: any) => b[1] - a[1]).slice(0, 5).map(([n]) => n);
+  const avg = cust.total_orders > 0 ? (cust.total_spent / cust.total_orders).toFixed(0) : "0";
+  const budget = +avg < 80 ? "اقتصادي" : +avg < 200 ? "متوسط" : "مرتفع";
+  const urgent = await getUrgentItems(chatId);
+
+  return `أنت "سلتي" 🛒، مدير مشتريات شخصي ذكي للعائلات في بريدة والقصيم.
+
+== معلومات العميل ==
+الاسم: ${cust.name || "عزيزي"}
+عدد طلباته: ${cust.total_orders}
+مستوى إنفاقه: ${budget} (متوسط ${avg} ريال/طلب)
+نقاط المكافآت: ${cust.loyalty_points}
+أكثر منتجاته طلباً: ${top.join("، ") || "لا توجد بيانات بعد"}
+${urgent.length ? `⚠️ منتجات على وشك النفاد: ${urgent.join("، ")}` : ""}
+
+== شخصيتك ==
+ودود، مباشر، بلهجة سعودية خليجية بسيطة. تحرص على توفير المال للعميل.
+استخدم عبارات مثل: "أبشر"، "من عيوني"، "يا هلا".
+
+== عند استخراج طلب ==
+أخرج JSON داخل code block هكذا فقط:
+\`\`\`json
+{"type":"order","items":[{"name":"اسم المنتج","qty":1,"unit":"كغ"}],"message":"رسالة ودية"}
+\`\`\`
+
+== قواعد ==
+- ردود قصيرة 3-5 أسطر
+- إيموجي معتدل
+- اختم بـ "تبي تضيف شي ثاني؟ 🛒"
+- إذا رد بـ "نعم" بعد اقتراح ← أضفه للطلب`;
+}
+
+// ═══════════════════════════════════════════
+// استدعاء Gemini
+// ═══════════════════════════════════════════
+async function callAI(userMsg: string, history: any[], prompt: string) {
+  const contents = [
+    { role: "user", parts: [{ text: prompt }] },
+    ...history.map((h: any) => ({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.content }] })),
+    { role: "user", parts: [{ text: userMsg }] },
+  ];
+  const res = await ai.models.generateContent({ model: "gemini-2.0-flash", contents });
+  const raw = res.text || "";
+  const match = raw.match(/```json\s*([\s\S]*?)```/);
+  if (match) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed.type === "order") return { raw, parsed };
+    } catch {}
+  }
+  return { raw, parsed: null };
+}
+
+// ═══════════════════════════════════════════
+// إرسال رسالة تيليجرام
+// ═══════════════════════════════════════════
+async function send(chatId: number, text: string, keyboard?: object) {
+  if (!bot) return;
+  const payload: any = { chat_id: chatId, text, parse_mode: "HTML" };
+  if (keyboard) payload.reply_markup = keyboard;
+  await (bot.telegram as any).sendMessage(chatId, text, { parse_mode: "HTML", reply_markup: keyboard });
+}
+
+function confirmKeyboard() {
+  return { inline_keyboard: [[
+    { text: "✅ تأكيد الطلب", callback_data: "confirm" },
+    { text: "❌ إلغاء",       callback_data: "cancel"  },
+  ]] };
+}
+
+function formatSummary(pricing: any, message: string): string {
+  const lines = pricing.items.map((i: any) =>
+    `• ${i.name} × ${i.qty} ${i.unit} — <b>${i.item_total} ريال</b> (${i.store})`
+  ).join("\n");
+  return `${message}\n\n📋 <b>ملخص طلبك:</b>\n${lines}\n\n` +
+    `💰 المجموع: <b>${pricing.total} ريال</b>\n` +
+    `🎁 وفّرت: <b>${pricing.saving} ريال</b>\n` +
+    `🚀 توصيل خلال 45–60 دقيقة`;
+}
+
+// ═══════════════════════════════════════════
+// Bot Logic
+// ═══════════════════════════════════════════
+if (bot) {
+  // رسائل عادية
+  bot.on("text", async (ctx) => {
+    const chatId = ctx.chat.id;
+    const uid = String(chatId);
+    const text = ctx.message.text.trim();
+    const name = ctx.from.first_name || "عزيزي";
+
+    const cust = await getOrCreateCustomer(chatId, name);
+
+    // /start
+    if (text === "/start") {
+      const urgent = await getUrgentItems(uid);
+      if (urgent.length && cust.total_orders > 1) {
+        await ctx.reply(
+          `أهلاً <b>${name}</b>! 👋\n\n` +
+          `⚠️ يبدو أن هذه المنتجات على وشك تنتهي:\n` +
+          urgent.map(i => `• ${i}`).join("\n") + "\n\nتبي أطلبها لك؟ 🛒",
+          { parse_mode: "HTML" }
+        );
+      } else {
+        await ctx.reply(
+          `أهلاً <b>${name}</b>! 👋\nأنا <b>سلتي</b> 🛒 — مدير مشترياتك الشخصي.\n\nقولي وش تحتاج وأجيب لك أرخص سعر! 💰`,
+          { parse_mode: "HTML" }
+        );
+      }
+      return;
+    }
+
+    // نقاطي
+    if (text.includes("نقاطي")) {
+      await ctx.reply(`⭐ نقاطك: <b>${cust.loyalty_points || 0} نقطة</b>\nكل 100 نقطة = خصم 10 ريال 🎁`, { parse_mode: "HTML" });
+      return;
+    }
+
+    const history = await getHistory(uid);
+    const prompt  = await buildPrompt(uid, cust);
+    const { raw, parsed } = await callAI(text, history, prompt);
+
+    await saveMsg(uid, "user", text);
+    await saveMsg(uid, "assistant", raw);
+
+    if (parsed?.type === "order" && parsed.items?.length) {
+      const pricing = await priceOrder(parsed.items);
+      await setDoc(doc(db, "customers", uid), { pending_order: { pricing, message: parsed.message } }, { merge: true });
+      await ctx.reply(formatSummary(pricing, parsed.message), { parse_mode: "HTML", reply_markup: confirmKeyboard() });
+    } else {
+      await ctx.reply(raw, { parse_mode: "HTML" });
+    }
+  });
+
+  // أزرار تأكيد / إلغاء
+  bot.on("callback_query", async (ctx: any) => {
+    const chatId = ctx.callbackQuery.message.chat.id;
+    const uid    = String(chatId);
+    const action = ctx.callbackQuery.data;
+    await ctx.answerCbQuery();
+
+    const custSnap = await getDoc(doc(db, "customers", uid));
+    if (!custSnap.exists()) return;
+    const cust = custSnap.data();
+    const pending = cust.pending_order;
+
+    if (action === "confirm" && pending) {
+      const { pricing, message } = pending;
+
+      await addDoc(collection(db, "orders"), {
+        customer_id: uid,
+        items: pricing.items,
+        total_amount: pricing.total,
+        saved_amount: pricing.saving,
+        status: "confirmed",
+        created_at: serverTimestamp(),
+      });
+
+      // تحديث سلوك العميل
+      const repeat = cust.repeat_items || {};
+      for (const item of pricing.items) repeat[item.name] = (repeat[item.name] || 0) + 1;
+      const pts = Math.floor(pricing.total / 10);
+      await updateDoc(doc(db, "customers", uid), {
+        pending_order: null,
+        repeat_items: repeat,
+        total_orders: increment(1),
+        total_spent:  increment(pricing.total),
+        loyalty_points: increment(pts),
+      });
+
+      await ctx.reply(
+        `✅ <b>تم تأكيد طلبك يا ${cust.name}!</b>\n\n` +
+        `💰 ${pricing.total} ريال | 🎁 وفّرت ${pricing.saving} ريال\n` +
+        `⭐ كسبت +${pts} نقطة\n🴣 المندوب في الطريق!`,
+        { parse_mode: "HTML" }
+      );
+
+    } else if (action === "cancel") {
+      await updateDoc(doc(db, "customers", uid), { pending_order: null });
+      await ctx.reply("تم الإلغاء 👍\nتبي تطلب شي ثاني؟ 🛒");
+    }
+  });
+
+  bot.launch();
+  console.log("✅ Telegram Bot running");
+}
+
+// ═══════════════════════════════════════════
+// Seed بيانات تجريبية
+// ═══════════════════════════════════════════
+async function seedIfEmpty() {
+  const snap = await getDocs(query(collection(db, "market_offers"), limit(1)));
+  if (!snap.empty) return;
+
+  const offers = [
+    { productName: "أرز مصري 5كغ",    marketName: "هايبر بنده",   offerPrice: 21.95, originalPrice: 25.00 },
+    { productName: "أرز بسمتي 5كغ",   marketName: "أسواق العثيم", offerPrice: 29.95, originalPrice: 35.00 },
+    { productName: "زيت نخيل 1.5ل",   marketName: "لولو هايبر",  offerPrice: 11.50, originalPrice: 13.00 },
+    { productName: "زيت زيتون 750مل", marketName: "هايبر بنده",   offerPrice: 26.95, originalPrice: 32.00 },
+    { productName: "حليب المراعي 1ل", marketName: "كارفور",        offerPrice:  4.95, originalPrice:  5.50 },
+    { productName: "حليب نادك 1ل",    marketName: "هايبر بنده",   offerPrice:  4.25, originalPrice:  5.00 },
+    { productName: "دجاج مجمد 1كغ",   marketName: "أسواق العثيم", offerPrice: 15.95, originalPrice: 18.00 },
+    { productName: "بيض بلدي 30حبة",  marketName: "لولو هايبر",  offerPrice: 19.95, originalPrice: 22.00 },
+    { productName: "عصير نادك 1ل",    marketName: "كارفور",        offerPrice:  4.95, originalPrice:  6.00 },
+    { productName: "مياه نسمة 1.5ل",  marketName: "هايبر بنده",   offerPrice:  1.15, originalPrice:  1.50 },
+    { productName: "سكر أبيض 2كغ",    marketName: "أسواق العثيم", offerPrice:  7.50, originalPrice:  8.50 },
+    { productName: "شاي أحمد 200جم",  marketName: "لولو هايبر",  offerPrice: 11.95, originalPrice: 14.00 },
+    { productName: "تمر سكري 1كغ",    marketName: "كارفور",        offerPrice: 32.00, originalPrice: 38.00 },
+    { productName: "معكرونة 500جم",   marketName: "هايبر بنده",   offerPrice:  5.95, originalPrice:  7.00 },
+    { productName: "طماطم طازج 1كغ",  marketName: "أسواق العثيم", offerPrice:  3.25, originalPrice:  4.00 },
+  ];
+
+  for (const o of offers) {
+    const id = Buffer.from(o.productName).toString("base64").slice(0, 20);
+    await setDoc(doc(db, "market_offers", id), { ...o, scrapedAt: new Date().toISOString() });
+  }
+  console.log("✅ Seeded market_offers");
+}
+
+// ═══════════════════════════════════════════
+// Express Server
+// ═══════════════════════════════════════════
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  app.get("/api/health", (_, res) => res.json({ ok: true, bot: !!bot }));
 
-  // Telegram Bot Logic
-  if (bot) {
-    bot.start((ctx) => {
-      ctx.reply('هلا والله! أنا وكيلك في "سلتي". وش محتاج للبيت اليوم؟ عندي عروض قوية على الرز والزيت.');
-    });
-
-    bot.on('text', async (ctx) => {
-      const message = ctx.message.text;
-      const chatId = ctx.chat.id.toString();
-      const userName = ctx.from.first_name || 'أحمد';
-
-      try {
-        // Fetch real offers from Firestore
-        const realOffers = await getLatestOffers();
-        const offersContext = realOffers.map(o => 
-          `- ${o.productName}: ${o.marketName} (${o.offerPrice} ريال ✅)، السعر الأصلي (${o.originalPrice} ريال).`
-        ).join("\n");
-
-        // Try to get the API key from multiple possible environment variables
-        // Fallback to provided key for testing as requested by user
-        const geminiApiKey = process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY" ? 
-                           process.env.GEMINI_API_KEY : 
-                           (process.env.API_KEY && process.env.API_KEY !== "MY_GEMINI_API_KEY" ? 
-                            process.env.API_KEY : 
-                            "AIzaSyDklv_ojJF0vnNMdiPXg8NMRsjltxhCf1g");
-        
-        if (!geminiApiKey) {
-          console.error("Gemini API Key is missing.");
-          await ctx.reply("عذراً، هناك مشكلة في إعدادات النظام (مفتاح الـ API مفقود). يرجى التواصل مع الدعم.");
-          return;
-        }
-
-        const aiClient = new GoogleGenAI({ apiKey: geminiApiKey });
-        
-        // Use a stable model name recommended for basic text tasks
-        const modelName = "gemini-3-flash-preview"; 
-        const systemInstruction = `
-          أنت "سلتي" — مساعد مقارنة أسعار ذكي للمتاجر في بريدة، القصيم.
-          
-          ## هويتك:
-          - اسمك سلتي.
-          - دورك: تساعد العميل يلقى أرخص سعر للمنتج اللي يبيه.
-          - أسلوبك: ودود، متعاون، وبسيط. تحدث بلهجة أهل بريدة/القصيم بشكل خفيف ومحبب.
-          
-          ## قواعد الرد — التزم بها دائماً:
-          1. الرد يكون متوازن — لا طويل ممل ولا قصير جاف.
-          2. رحب بالعميل بشكل لطيف ومختصر في بداية كل محادثة جديدة.
-          3. اعرض الأسعار بوضوح مع إضافة لمسة ودية (مثل: "لقيت لك أرخص سعر..").
-          4. استخدم الإيموجي بشكل معقول (3-4 إيموجي كحد أقصى) لإضافة حيوية للرد.
-          5. لا تخترع أسعاراً — فقط ما هو موجود في البيانات.
-          
-          ## تنسيق عرض الأسعار:
-          عند السؤال عن منتج، الرد يكون هكذا:
-          [اسم المنتج] — [المتجر]: [السعر] ريال ✅
-          [اسم المنتج] — [المتجر]: [السعر] ريال
-          وفرت: [الفرق] ريال عن سعر السوق.. يا بلاش! 😍
-          
-          ## إذا ما لقيت المنتج:
-          "والله يا غالي ما لقيت سعر لهذا المنتج حالياً، جرب تسأل عن شي ثاني وأبشر بسعدك."
-          
-          ## عند تأكيد الطلب:
-          "تم تأكيد طلبك يا بطل! كسبت [X] نقطة — رصيدك الحين: [Y] نقطة 🎯"
-          
-          ## بيانات الأسعار الحقيقية (محدثة):
-          ${offersContext || "لا توجد عروض حالية، استخدم البيانات الافتراضية."}
-          - رز هندي 5 كيلو: العثيم (17 ريال ✅)، بنده (22 ريال). توفير 5 ريال.
-          - زيت 1.5 لتر: التميمي (14 ريال ✅)، السدحان (18 ريال). توفير 4 ريال.
-          
-          ## ممنوع تماماً:
-          - الترحيب المطول جداً الذي يضيع وقت العميل.
-          - اختراع أسعار أو عروض غير موجودة.
-          - الإيموجي الزائد جداً (أكثر من 5).
-          - تكرار نفس الجملة في كل رد.
-        `;
-
-        const response = await aiClient.models.generateContent({
-          model: modelName,
-          contents: [
-            { role: "user", parts: [{ text: systemInstruction }] },
-            { role: "user", parts: [{ text: message }] }
-          ]
-        });
-
-        const reply = response.text || "عذراً، لم أستطع فهم ذلك.";
-        
-        // Check if agent confirmed order (simple keyword check for now)
-        if (reply.includes("تأكيد") || reply.includes("تم تأكيد")) {
-          // Log order to Firestore
-          await addDoc(collection(db, 'orders'), {
-            customerId: chatId,
-            customerName: userName,
-            status: 'pending',
-            totalAmount: 31, // Mock value
-            totalSavings: 9, // Mock value
-            createdAt: serverTimestamp(),
-            source: 'telegram'
-          });
-        }
-
-        await ctx.reply(reply);
-      } catch (error) {
-        console.error("Bot Error:", error);
-        await ctx.reply("عذراً، واجهت مشكلة في الاتصال. حاول مرة أخرى.");
-      }
-    });
-
-    bot.launch();
-    console.log("Telegram Bot is running...");
-  } else {
-    console.warn("TELEGRAM_BOT_TOKEN is missing. Bot will not start.");
-  }
-
-  // API Routes
-  app.get("/api/health", (req, res) => {
-    res.json({ status: "ok", botActive: !!bot });
-  });
-
-  app.get("/api/scrape", async (req, res) => {
-    const offers = await scrapeOffers();
-    res.json({ status: "success", count: offers.length, data: offers });
-  });
-
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    const dist = path.join(process.cwd(), "dist");
+    app.use(express.static(dist));
+    app.get("*", (_, res) => res.sendFile(path.join(dist, "index.html")));
   }
 
-  app.listen(PORT, "0.0.0.0", async () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-    // Trigger initial scrape and seed
-    await seedProducts();
-    await scrapeOffers();
+  app.listen(3000, "0.0.0.0", async () => {
+    console.log("🚀 Server running on http://localhost:3000");
+    await seedIfEmpty();
   });
 }
 
